@@ -48,6 +48,10 @@ coverage.xml
 *.cover
 *.pyo
 .hypothesis/
+
+# Test files and folders
+test_*.py
+test/
 .pytest_cache/
 cover/
 

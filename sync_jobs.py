@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Anduril 台北職缺自動同步腳本
+Anduril 台北/東京職缺自動同步腳本
 自動抓取 Anduril 職缺頁面並更新到 Notion 資料庫
 """
 
@@ -13,8 +13,15 @@ from bs4 import BeautifulSoup
 from notion_client import Client
 
 # 設定
-ANDURIL_CAREERS_URL = "https://www.anduril.com/open-roles?location=taipei-taiwan"
 GREENHOUSE_API_BASE = "https://boards-api.greenhouse.io/v1/boards/andurilindustries/jobs"
+
+# 要追蹤的地點關鍵字（不區分大小寫）
+TARGET_LOCATIONS = {
+    "taipei": "Taipei Taiwan",
+    "taiwan": "Taipei Taiwan",
+    "tokyo": "Tokyo Japan",
+    "japan": "Tokyo Japan",
+}
 
 # 從環境變數讀取
 NOTION_API_KEY = os.environ.get("NOTION_API_KEY")
@@ -22,21 +29,48 @@ NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID")
 
 
 def get_jobs_from_greenhouse():
-    """從 Greenhouse API 獲取職缺列表"""
+    """從 Greenhouse API 獲取職缺列表（優化流量版本）"""
     jobs = []
 
     try:
-        # Greenhouse 公開 API
-        response = requests.get(f"{GREENHOUSE_API_BASE}?content=true")
+        # 步驟 1: 先獲取職缺列表（不含詳細內容）- 節省流量
+        print("📋 正在獲取職缺列表...")
+        response = requests.get(GREENHOUSE_API_BASE)
         response.raise_for_status()
         data = response.json()
+        
+        all_jobs = data.get("jobs", [])
+        print(f"📊 API 回傳 {len(all_jobs)} 個職缺")
 
-        for job in data.get("jobs", []):
-            # 篩選台北職缺
+        # 步驟 2: 篩選出目標地區的職缺
+        target_job_ids = []
+        target_job_basic = []
+        
+        for job in all_jobs:
             location = job.get("location", {}).get("name", "")
-            if "taipei" in location.lower() or "taiwan" in location.lower():
+            location_lower = location.lower()
+            
+            # 檢查是否匹配任何目標地點
+            if any(keyword in location_lower for keyword in TARGET_LOCATIONS.keys()):
+                target_job_ids.append(job.get("id"))
+                target_job_basic.append(job)
+        
+        print(f"🎯 找到 {len(target_job_ids)} 個目標地區職缺")
+
+        # 步驟 3: 只獲取目標職缺的詳細內容
+        for i, job_id in enumerate(target_job_ids, 1):
+            try:
+                print(f"  📥 正在獲取職缺 {i}/{len(target_job_ids)} 的詳細內容...")
+                detail_response = requests.get(f"{GREENHOUSE_API_BASE}/{job_id}")
+                detail_response.raise_for_status()
+                job_detail = detail_response.json()
+                
+                # 取得基本資訊
+                basic_info = target_job_basic[i-1]
+                location = basic_info.get("location", {}).get("name", "")
+                
                 # 解析職缺內容
-                content = job.get("content", "")
+                content = job_detail.get("content", "")
                 soup = BeautifulSoup(content, "html.parser")
 
                 # 提取各區段
@@ -49,24 +83,28 @@ def get_jobs_from_greenhouse():
                 experience = extract_experience(required_quals)
 
                 # 提取部門
-                departments = job.get("departments", [])
+                departments = job_detail.get("departments", [])
                 department = departments[0].get("name", "Unknown") if departments else "Unknown"
 
                 jobs.append({
-                    "id": str(job.get("id", "")),
-                    "title": job.get("title", ""),
+                    "id": str(job_detail.get("id", "")),
+                    "title": job_detail.get("title", ""),
                     "location": location,
                     "department": department,
-                    "apply_url": job.get("absolute_url", ""),
+                    "apply_url": job_detail.get("absolute_url", ""),
                     "experience": experience,
                     "about_job": about_job,
                     "what_youll_do": what_youll_do,
                     "required_qualifications": required_quals,
                     "preferred_qualifications": preferred_quals,
-                    "updated_at": job.get("updated_at", ""),
+                    "updated_at": job_detail.get("updated_at", ""),
                 })
+                
+            except Exception as e:
+                print(f"  ⚠️ 獲取職缺 {job_id} 詳細內容失敗: {e}")
+                continue
 
-        print(f"✅ 找到 {len(jobs)} 個台北職缺")
+        print(f"✅ 成功獲取 {len(jobs)} 個職缺（台北/東京）")
         return jobs
 
     except Exception as e:
@@ -133,7 +171,7 @@ def create_job_page(notion, database_id, job):
     properties = {
         "職位名稱": {"title": [{"text": {"content": job["title"]}}]},
         "部門": {"select": {"name": normalize_department(job["department"])}},
-        "地點": {"select": {"name": "Taipei Taiwan"}},
+        "地點": {"select": {"name": normalize_location(job["location"])}},
         "REQ ID": {"rich_text": [{"text": {"content": job["id"]}}]},
         "經驗要求": {"rich_text": [{"text": {"content": job["experience"]}}]},
         "申請連結": {"url": job["apply_url"]},
@@ -228,6 +266,19 @@ def normalize_department(dept):
         return dept[:100]  # Notion 限制
 
 
+def normalize_location(location):
+    """標準化地點名稱"""
+    location_lower = location.lower()
+    
+    # 根據關鍵字映射到標準地點名稱
+    for keyword, standard_name in TARGET_LOCATIONS.items():
+        if keyword in location_lower:
+            return standard_name
+    
+    # 如果沒有匹配，返回原始地點（截斷）
+    return location[:100]  # Notion 限制
+
+
 def mark_removed_jobs(notion, existing_jobs, current_job_urls):
     """標記已移除的職缺"""
     for url, data in existing_jobs.items():
@@ -248,7 +299,7 @@ def mark_removed_jobs(notion, existing_jobs, current_job_urls):
 def main():
     """主程式"""
     print("=" * 50)
-    print("🚀 Anduril 台北職缺同步開始")
+    print("🚀 Anduril 台北/東京職缺同步開始")
     print(f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 50)
 
@@ -267,7 +318,7 @@ def main():
     # 獲取最新職缺
     jobs = get_jobs_from_greenhouse()
     if not jobs:
-        print("⚠️ 沒有找到台北職缺，嘗試備用方法...")
+        print("⚠️ 沒有找到台北/東京職缺，嘗試備用方法...")
         # 可以加入備用抓取方法
 
     # 獲取現有 Notion 資料
