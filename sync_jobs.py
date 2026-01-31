@@ -148,13 +148,16 @@ def get_existing_jobs_from_notion(notion, database_id):
         for page in results.get("results", []):
             props = page.get("properties", {})
 
-            # 獲取申請連結作為唯一識別
-            url_prop = props.get("申請連結", {})
-            if url_prop.get("url"):
-                existing[url_prop["url"]] = {
-                    "page_id": page["id"],
-                    "properties": props
-                }
+            # 獲取 REQ ID 作為唯一識別符
+            req_id_prop = props.get("REQ ID", {})
+            rich_text = req_id_prop.get("rich_text", [])
+            if rich_text and len(rich_text) > 0:
+                req_id = rich_text[0].get("text", {}).get("content", "")
+                if req_id:
+                    existing[req_id] = {
+                        "page_id": page["id"],
+                        "properties": props
+                    }
 
         print(f"📋 Notion 中現有 {len(existing)} 個職缺")
         return existing
@@ -279,10 +282,10 @@ def normalize_location(location):
     return location[:100]  # Notion 限制
 
 
-def mark_removed_jobs(notion, existing_jobs, current_job_urls):
+def mark_removed_jobs(notion, existing_jobs, current_job_ids):
     """標記已移除的職缺"""
-    for url, data in existing_jobs.items():
-        if url not in current_job_urls:
+    for req_id, data in existing_jobs.items():
+        if req_id not in current_job_ids:
             try:
                 # 更新備註欄位
                 notion.pages.update(
@@ -291,7 +294,7 @@ def mark_removed_jobs(notion, existing_jobs, current_job_urls):
                         "備註": {"rich_text": [{"text": {"content": f"⚠️ 職缺可能已關閉 ({datetime.now().strftime('%Y-%m-%d')})"}}]}
                     }
                 )
-                print(f"  ⚠️ 標記已關閉: {url}")
+                print(f"  ⚠️ 標記已關閉: REQ ID {req_id}")
             except Exception as e:
                 print(f"  ❌ 標記失敗: {e}")
 
@@ -325,19 +328,20 @@ def main():
     existing_jobs = get_existing_jobs_from_notion(notion, NOTION_DATABASE_ID)
 
     # 同步職缺
-    current_urls = set()
+    current_req_ids = set()
     for job in jobs:
-        current_urls.add(job["apply_url"])
+        req_id = job["id"]
+        current_req_ids.add(req_id)
 
-        if job["apply_url"] in existing_jobs:
+        if req_id in existing_jobs:
             # 更新現有職缺
-            update_job_page(notion, existing_jobs[job["apply_url"]]["page_id"], job)
+            update_job_page(notion, existing_jobs[req_id]["page_id"], job)
         else:
             # 新增職缺
             create_job_page(notion, NOTION_DATABASE_ID, job)
 
     # 標記已移除的職缺
-    mark_removed_jobs(notion, existing_jobs, current_urls)
+    mark_removed_jobs(notion, existing_jobs, current_req_ids)
 
     print("=" * 50)
     print("✅ 同步完成!")
