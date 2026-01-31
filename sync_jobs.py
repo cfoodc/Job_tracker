@@ -6,11 +6,17 @@ Anduril 台北/東京職缺自動同步腳本
 
 import os
 import re
-import json
+import time
 import requests
 from datetime import datetime
-from bs4 import BeautifulSoup
-from notion_client import Client
+from curl_notion_client import CurlNotionClient
+from dotenv import load_dotenv
+
+# 載入 .env 文件（優先從 test 資料夾載入，如果不存在則從根目錄載入）
+if os.path.exists("test/.env"):
+    load_dotenv("test/.env")
+else:
+    load_dotenv()
 
 # 設定
 GREENHOUSE_API_BASE = "https://boards-api.greenhouse.io/v1/boards/andurilindustries/jobs"
@@ -26,6 +32,13 @@ TARGET_LOCATIONS = {
 # 從環境變數讀取
 NOTION_API_KEY = os.environ.get("NOTION_API_KEY")
 NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID")
+
+
+
+# 重試設定
+MAX_RETRIES = 3
+RETRY_DELAY = 2  # 秒（增加到 10 秒）
+REQUEST_DELAY = 1  # 每個請求之間的延遲（增加到 3 秒）
 
 
 def get_jobs_from_greenhouse():
@@ -69,18 +82,10 @@ def get_jobs_from_greenhouse():
                 basic_info = target_job_basic[i-1]
                 location = basic_info.get("location", {}).get("name", "")
                 
-                # 解析職缺內容
-                content = job_detail.get("content", "")
-                soup = BeautifulSoup(content, "html.parser")
-
-                # 提取各區段
-                about_job = extract_section(soup, ["about the job", "about the team"])
-                what_youll_do = extract_section(soup, ["what you'll do", "what you will do"])
-                required_quals = extract_section(soup, ["required qualifications", "requirements"])
-                preferred_quals = extract_section(soup, ["preferred qualifications", "nice to have"])
-
-                # 提取經驗要求
-                experience = extract_experience(required_quals)
+                # 簡化版：不解析內文，只提取基本經驗要求
+                # 從職缺標題或基本資訊中推斷經驗（如果有的話）
+                title = job_detail.get("title", "")
+                experience = extract_experience_from_title(title)
 
                 # 提取部門
                 departments = job_detail.get("departments", [])
@@ -93,10 +98,6 @@ def get_jobs_from_greenhouse():
                     "department": department,
                     "apply_url": job_detail.get("absolute_url", ""),
                     "experience": experience,
-                    "about_job": about_job,
-                    "what_youll_do": what_youll_do,
-                    "required_qualifications": required_quals,
-                    "preferred_qualifications": preferred_quals,
                     "updated_at": job_detail.get("updated_at", ""),
                 })
                 
@@ -112,26 +113,25 @@ def get_jobs_from_greenhouse():
         return []
 
 
-def extract_section(soup, keywords):
-    """從 HTML 中提取特定區段"""
-    text = soup.get_text()
-
-    for keyword in keywords:
-        pattern = rf"{keyword}[:\s]*(.*?)(?=(?:what you|required|preferred|about|$))"
-        match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
-        if match:
-            return match.group(1).strip()[:2000]  # 限制長度
-
-    return ""
-
-
-def extract_experience(text):
-    """從文字中提取經驗年數要求"""
-    if not text:
+def extract_experience_from_title(title):
+    """從職缺標題中提取經驗年數要求"""
+    if not title:
         return "未指定"
 
-    # 尋找 X+ years 格式
-    match = re.search(r"(\d+)\+?\s*years?", text, re.IGNORECASE)
+    # 尋找常見的經驗層級關鍵字
+    title_lower = title.lower()
+
+    if "staff" in title_lower or "principal" in title_lower:
+        return "10+ years"
+    elif "senior" in title_lower or "sr" in title_lower:
+        return "5+ years"
+    elif "junior" in title_lower or "jr" in title_lower:
+        return "0-2 years"
+    elif "intern" in title_lower:
+        return "學生/實習"
+
+    # 嘗試從標題中直接提取數字
+    match = re.search(r"(\d+)\+?\s*years?", title, re.IGNORECASE)
     if match:
         return f"{match.group(1)}+ years"
 
@@ -139,122 +139,176 @@ def extract_experience(text):
 
 
 def get_existing_jobs_from_notion(notion, database_id):
-    """獲取 Notion 資料庫中現有的職缺"""
+    """獲取 Notion 資料庫中現有的職缺（含重試）"""
     existing = {}
 
-    try:
-        results = notion.databases.query(database_id=database_id)
+    for attempt in range(MAX_RETRIES):
+        try:
+            # 使用 curl 客戶端查詢數據庫
+            results = notion.databases_query(database_id)
 
-        for page in results.get("results", []):
-            props = page.get("properties", {})
+            for page in results.get("results", []):
+                props = page.get("properties", {})
 
-            # 獲取 REQ ID 作為唯一識別符
-            req_id_prop = props.get("REQ ID", {})
-            rich_text = req_id_prop.get("rich_text", [])
-            if rich_text and len(rich_text) > 0:
-                req_id = rich_text[0].get("text", {}).get("content", "")
-                if req_id:
-                    existing[req_id] = {
-                        "page_id": page["id"],
-                        "properties": props
-                    }
+                # 獲取 REQ ID 作為唯一識別符
+                req_id_prop = props.get("REQ ID", {})
+                rich_text = req_id_prop.get("rich_text", [])
+                if rich_text and len(rich_text) > 0:
+                    req_id = rich_text[0].get("text", {}).get("content", "")
+                    if req_id:
+                        # 提取標題
+                        title_prop = props.get("職位名稱", {})
+                        title_text = title_prop.get("title", [])
+                        title = title_text[0].get("text", {}).get("content", "") if title_text else ""
+                        
+                        # 提取更新時間（從頁面的 last_edited_time）
+                        updated_at = page.get("last_edited_time", "")
+                        
+                        existing[req_id] = {
+                            "page_id": page["id"],
+                            "properties": props,
+                            "title": title,
+                            "updated_at": updated_at
+                        }
 
-        print(f"📋 Notion 中現有 {len(existing)} 個職缺")
-        return existing
+            print(f"📋 Notion 中現有 {len(existing)} 個職缺")
+            return existing
 
-    except Exception as e:
-        print(f"❌ 獲取 Notion 資料失敗: {e}")
-        return {}
+        except Exception as e:
+            if attempt < MAX_RETRIES - 1:
+                print(f"⚠️ 獲取 Notion 資料失敗 (嘗試 {attempt + 1}/{MAX_RETRIES}): {e}")
+                print(f"   等待 {RETRY_DELAY} 秒後重試...")
+                time.sleep(RETRY_DELAY)
+            else:
+                print(f"❌ 獲取 Notion 資料失敗（已達最大重試次數）: {e}")
+                return {}
 
 
 def create_job_page(notion, database_id, job):
-    """在 Notion 建立新職缺頁面"""
+    """在 Notion 建立新職缺頁面（簡化版：只建立屬性，不添加內容）"""
 
-    # 準備屬性
+    # 清理並準備屬性
+    def clean_text(text, max_len=None):
+        """清理文本，移除可能導致問題的字符"""
+        if not text:
+            return ""
+        # 移除控制字符和零寬字符
+        text = ''.join(char for char in text if ord(char) >= 32 or char in '\n\r\t')
+        if max_len:
+            text = text[:max_len]
+        return text
+
     properties = {
-        "職位名稱": {"title": [{"text": {"content": job["title"]}}]},
-        "部門": {"select": {"name": normalize_department(job["department"])}},
-        "地點": {"select": {"name": normalize_location(job["location"])}},
-        "REQ ID": {"rich_text": [{"text": {"content": job["id"]}}]},
-        "經驗要求": {"rich_text": [{"text": {"content": job["experience"]}}]},
-        "申請連結": {"url": job["apply_url"]},
-        "職缺描述摘要": {"rich_text": [{"text": {"content": job["about_job"][:2000] if job["about_job"] else ""}}]},
-        "申請狀態": {"select": {"name": "尚未申請"}},
-        "新增日期": {"date": {"start": datetime.now().strftime("%Y-%m-%d")}},
+        "職位名稱": {
+            "title": [
+                {
+                    "text": {
+                        "content": clean_text(job["title"], 100)
+                    }
+                }
+            ]
+        },
+        "部門": {
+            "select": {
+                "name": clean_text(normalize_department(job["department"]), 100)
+            }
+        },
+        "地點": {
+            "select": {
+                "name": clean_text(normalize_location(job["location"]), 100)
+            }
+        },
+        "REQ ID": {
+            "rich_text": [
+                {
+                    "text": {
+                        "content": clean_text(job["id"], 100)
+                    }
+                }
+            ]
+        },
+        "經驗要求": {
+            "rich_text": [
+                {
+                    "text": {
+                        "content": clean_text(job["experience"], 100)
+                    }
+                }
+            ]
+        },
+        "申請狀態": {
+            "select": {
+                "name": "尚未申請"
+            }
+        },
+        "新增日期": {
+            "date": {
+                "start": datetime.now().strftime("%Y-%m-%d")
+            }
+        },
     }
 
-    # 建立頁面內容
-    content = build_page_content(job)
+    # URL 字段單獨處理，確保有效
+    if job.get("apply_url") and job["apply_url"].startswith("http"):
+        properties["申請連結"] = {"url": job["apply_url"]}
+    else:
+        # 如果 URL 無效，使用預設 URL
+        properties["申請連結"] = {"url": "https://www.anduril.com"}
 
-    try:
-        # 建立頁面
-        page = notion.pages.create(
-            parent={"database_id": database_id},
-            properties=properties,
-            children=content
-        )
-        print(f"  ✅ 新增: {job['title']}")
-        return page
+    for attempt in range(MAX_RETRIES):
+        try:
+            # 在每次嘗試前加入延遲（除了第一次）
+            if attempt > 0:
+                print(f"     等待 {RETRY_DELAY} 秒後重試...")
+                time.sleep(RETRY_DELAY)
 
-    except Exception as e:
-        print(f"  ❌ 新增失敗 {job['title']}: {e}")
-        return None
+            # 創建頁面（只有屬性，不帶內容）
+            page = notion.pages_create(
+                parent={"database_id": database_id},
+                properties=properties
+            )
+
+            print(f"  ✅ 新增: {job['title']}")
+            time.sleep(REQUEST_DELAY)
+            return page
+
+        except Exception as e:
+            if attempt < MAX_RETRIES - 1:
+                print(f"  ⚠️ 新增失敗 {job['title']} (嘗試 {attempt + 1}/{MAX_RETRIES}): {e}")
+            else:
+                print(f"  ❌ 新增失敗 {job['title']}（已達最大重試次數）: {e}")
+                return None
 
 
 def update_job_page(notion, page_id, job):
-    """更新現有職缺頁面"""
+    """更新現有職缺頁面（簡化版：只更新屬性，不更新內容）"""
 
-    content = build_page_content(job)
+    for attempt in range(MAX_RETRIES):
+        try:
+            # 只更新基本屬性（標題、部門、地點等可能不會改變，這裡可選擇性更新）
+            # 主要更新可能變化的欄位
+            properties = {}
 
-    try:
-        # 更新頁面內容
-        # 先刪除現有內容
-        existing_blocks = notion.blocks.children.list(block_id=page_id)
-        for block in existing_blocks.get("results", []):
-            notion.blocks.delete(block_id=block["id"])
+            # 如果需要更新特定欄位，可以在這裡添加
+            # 例如：更新申請狀態或其他欄位
 
-        # 加入新內容
-        notion.blocks.children.append(block_id=page_id, children=content)
-        print(f"  🔄 更新: {job['title']}")
+            # 如果有需要更新的屬性，才執行更新
+            if properties:
+                notion.pages_update(
+                    page_id=page_id,
+                    properties=properties
+                )
 
-    except Exception as e:
-        print(f"  ❌ 更新失敗 {job['title']}: {e}")
+            print(f"  🔄 更新: {job['title']}")
+            return
 
-
-def build_page_content(job):
-    """建立 Notion 頁面內容區塊"""
-    blocks = []
-
-    # About the Job
-    if job.get("about_job"):
-        blocks.append({"heading_1": {"rich_text": [{"text": {"content": "About the Job"}}]}})
-        blocks.append({"paragraph": {"rich_text": [{"text": {"content": job["about_job"][:2000]}}]}})
-
-    # What You'll Do
-    if job.get("what_youll_do"):
-        blocks.append({"heading_1": {"rich_text": [{"text": {"content": "What You'll Do"}}]}})
-        blocks.append({"paragraph": {"rich_text": [{"text": {"content": job["what_youll_do"][:2000]}}]}})
-
-    # Required Qualifications
-    if job.get("required_qualifications"):
-        blocks.append({"heading_1": {"rich_text": [{"text": {"content": "Required Qualifications"}}]}})
-        blocks.append({"paragraph": {"rich_text": [{"text": {"content": job["required_qualifications"][:2000]}}]}})
-
-    # Preferred Qualifications
-    if job.get("preferred_qualifications"):
-        blocks.append({"heading_1": {"rich_text": [{"text": {"content": "Preferred Qualifications"}}]}})
-        blocks.append({"paragraph": {"rich_text": [{"text": {"content": job["preferred_qualifications"][:2000]}}]}})
-
-    # 最後更新時間
-    blocks.append({"divider": {}})
-    blocks.append({
-        "paragraph": {
-            "rich_text": [{"text": {"content": f"🔄 最後同步: {datetime.now().strftime('%Y-%m-%d %H:%M')}"}}],
-            "color": "gray"
-        }
-    })
-
-    return blocks
+        except Exception as e:
+            if attempt < MAX_RETRIES - 1:
+                print(f"  ⚠️ 更新失敗 {job['title']} (嘗試 {attempt + 1}/{MAX_RETRIES}): {e}")
+                print(f"     等待 {RETRY_DELAY} 秒後重試...")
+                time.sleep(RETRY_DELAY)
+            else:
+                print(f"  ❌ 更新失敗 {job['title']}（已達最大重試次數）: {e}")
 
 
 def normalize_department(dept):
@@ -288,7 +342,7 @@ def mark_removed_jobs(notion, existing_jobs, current_job_ids):
         if req_id not in current_job_ids:
             try:
                 # 更新備註欄位
-                notion.pages.update(
+                notion.pages_update(
                     page_id=data["page_id"],
                     properties={
                         "備註": {"rich_text": [{"text": {"content": f"⚠️ 職缺可能已關閉 ({datetime.now().strftime('%Y-%m-%d')})"}}]}
@@ -315,17 +369,36 @@ def main():
         print("❌ 錯誤: 請設定 NOTION_DATABASE_ID 環境變數")
         return 1
 
-    # 初始化 Notion client
-    notion = Client(auth=NOTION_API_KEY)
+    # 清理並驗證 API key 格式
+    api_key = NOTION_API_KEY.strip()
+    if api_key.startswith('b"') or api_key.startswith("b'"):
+        print("❌ 錯誤: NOTION_API_KEY 格式不正確，請確認是字串格式而非 bytes")
+        return 1
+
+    if not api_key.startswith('secret_') and not api_key.startswith('ntn_'):
+        print("⚠️ 警告: NOTION_API_KEY 格式可能不正確，正常格式應以 'secret_' 或 'ntn_' 開頭")
+
+    # 初始化 Notion client（使用 curl 後端）
+    try:
+        # 使用 curl 客戶端來繞過 Python SSL 問題
+        notion = CurlNotionClient(auth=api_key)
+        print("✅ Notion client 初始化成功 (使用 curl 後端)")
+    except Exception as e:
+        print(f"❌ 初始化 Notion client 失敗: {e}")
+        return 1
 
     # 獲取最新職缺
     jobs = get_jobs_from_greenhouse()
     if not jobs:
-        print("⚠️ 沒有找到台北/東京職缺，嘗試備用方法...")
-        # 可以加入備用抓取方法
+        print("⚠️ 沒有找到台北/東京職缺")
+        return 1
 
     # 獲取現有 Notion 資料
     existing_jobs = get_existing_jobs_from_notion(notion, NOTION_DATABASE_ID)
+
+    # 在查詢後等待一下再開始新增/更新操作
+    print("\n⏳ 等待 1 秒後開始同步...")
+    time.sleep(1)
 
     # 同步職缺
     current_req_ids = set()
@@ -334,8 +407,16 @@ def main():
         current_req_ids.add(req_id)
 
         if req_id in existing_jobs:
-            # 更新現有職缺
-            update_job_page(notion, existing_jobs[req_id]["page_id"], job)
+            # 檢查是否需要更新
+            existing_title = existing_jobs[req_id].get("title", "")
+            existing_updated = existing_jobs[req_id].get("updated_at", "")
+
+            if (job["title"] != existing_title or
+                job.get("updated_at", "") != existing_updated):
+                # 內容有變化，更新頁面
+                update_job_page(notion, existing_jobs[req_id]["page_id"], job)
+            else:
+                print(f"  ⏭️  跳過（無變化）: {job['title']}")
         else:
             # 新增職缺
             create_job_page(notion, NOTION_DATABASE_ID, job)

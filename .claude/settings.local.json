@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(source ~/.zshrc)",
+      "Bash(python3:*)",
+      "Bash(conda activate:*)",
+      "Bash(python sync_jobs.py:*)",
+      "Bash(source:*)",
+      "Bash(/Users/cfood/miniforge3/envs/condve11/bin/python3:*)",
+      "Bash(curl:*)"
+    ]
+  }
+}

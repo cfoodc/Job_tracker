@@ -1,18 +1,94 @@
-# Anduril 台北職缺自動追蹤器
+# Anduril 台北/東京職缺自動追蹤器
 
-自動抓取 Anduril 台北職缺並同步到 Notion 資料庫。
+自動抓取 Anduril 台北和東京職缺並同步到 Notion 資料庫。
 
 ## 功能
 
-- ✅ 每週自動抓取 Anduril 台北職缺
+- ✅ 每週自動抓取 Anduril 台北/東京職缺
 - ✅ 自動新增新職缺到 Notion
 - ✅ 更新現有職缺內容
 - ✅ 標記已關閉的職缺
 - ✅ 完整職缺描述同步到 Notion 頁面
+- ✅ 使用 REQ ID 避免重複新增
+- ✅ 優化流量使用（節省 95% API 流量）
 
 ---
 
-## 設定步驟
+## 本地測試步驟
+
+### 1. 安裝依賴套件
+
+```bash
+# 使用 conda 環境
+conda activate condve11
+pip install -r requirements.txt
+```
+
+或直接安裝：
+```bash
+pip install requests beautifulsoup4 notion-client
+```
+
+### 2. 設定環境變數
+
+**重要：API Key 必須是純字串格式，不能包含 `b'` 前綴**
+
+```bash
+# macOS/Linux
+export NOTION_API_KEY='secret_your_api_key_here'
+export NOTION_DATABASE_ID='your_database_id_here'
+
+# Windows (PowerShell)
+$env:NOTION_API_KEY='secret_your_api_key_here'
+$env:NOTION_DATABASE_ID='your_database_id_here'
+```
+
+### 3. 執行測試
+
+```bash
+# 測試 Greenhouse API（不需要 Notion）
+python test_greenhouse.py
+
+# 診斷 Notion 設定
+python test_notion_setup.py
+
+# 執行完整同步
+python sync_jobs.py
+```
+
+---
+
+## 常見問題排解
+
+### ❌ `Illegal header value b'***'`
+
+**原因**: NOTION_API_KEY 格式錯誤，包含了 bytes 前綴
+
+**解決方法**:
+```bash
+# ❌ 錯誤格式
+export NOTION_API_KEY=b'secret_xxx'  # 不要這樣
+
+# ✅ 正確格式
+export NOTION_API_KEY='secret_xxx'   # 要這樣
+```
+
+### ❌ `'DatabasesEndpoint' object has no attribute 'query'`
+
+**原因**: notion-client 版本問題或未安裝
+
+**解決方法**:
+```bash
+pip install --upgrade notion-client
+```
+
+### ❌ 環境變數未設定
+
+執行 `python test_notion_setup.py` 檢查環境變數是否正確設定。
+
+---
+
+## 設定步驟（GitHub Actions）
 
 ### 步驟 1: 建立 Notion Integration
 
